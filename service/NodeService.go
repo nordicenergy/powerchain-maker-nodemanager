@@ -2,32 +2,23 @@ package service
 
 import (
 	"bytes"
-	"crypto/ecdsa"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
+	"github.com/magiconair/properties"
+	"github.com/nordicenergy/powerchain-maker-nodemanager/client"
+	"github.com/nordicenergy/powerchain-maker-nodemanager/contractclient"
+	"github.com/nordicenergy/powerchain-maker-nodemanager/contracthandler"
+	"github.com/nordicenergy/powerchain-maker-nodemanager/util"
+	"gopkg.in/gomail.v2"
 	"io/ioutil"
-	"math/big"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
-	"unsafe"
-
-	"github.com/magiconair/properties"
 	log "github.com/sirupsen/logrus"
-	"github.com/nordicenergy/powerchain-maker-nodemanager/client"
-	"github.com/nordicenergy/powerchain-maker-nodemanager/contractclient"
-	internalContract "github.com/nordicenergy/powerchain-maker-nodemanager/contractclient/internalcontract"
-	"github.com/nordicenergy/powerchain-maker-nodemanager/util"
-	"github.com/nordicenergy/powerchain/accounts/abi/bind"
-	"github.com/nordicenergy/powerchain/common"
-	"github.com/nordicenergy/powerchain/crypto"
-	"github.com/nordicenergy/powerchain/ethclient"
-	powerchainScClient "github.com/nordicenergy/powerchain_contracts/contracts/client"
+	"path/filepath"
+	"encoding/json"
 )
 
 type ConnectionInfo struct {
@@ -50,30 +41,24 @@ type NodeInfo struct {
 	TotalNodeCount int              `json:"totalNodeCount"`
 	Active         string           `json:"active"`
 	ConnectionInfo ConnectionInfo   `json:"connectionInfo"`
-	Role           string           `json:"role"`
+	RaftRole       string           `json:"raftRole"`
+	RaftID         int              `json:"raftID"`
 	BlockNumber    int64            `json:"blockNumber"`
 	PendingTxCount int              `json:"pendingTxCount"`
+	Genesis        string           `json:"genesis"`
 	AdminInfo      client.AdminInfo `json:"adminInfo"`
-	ChainId        int              `json:"chainId"`
 }
 
 type JoinNetworkRequest struct {
 	EnodeID   string `json:"enode-id,omitempty"`
 	IPAddress string `json:"ip-address,omitempty"`
 	Nodename  string `json:"nodename,omitempty"`
-	AccPubKey string `json:"acc-pub-key,omitempty"`
-	ChainID   string `json:"chain-id,omitempty"`
-	Role      string `json:"role,omitempty"`
 }
 
 type GetGenesisResponse struct {
 	ContstellationPort string `json:"contstellation-port"`
 	NetID              string `json:"netID"`
 	Genesis            string `json:"genesis"`
-}
-
-type GetNmcAddressResponse struct {
-	ContstellationPort string `json:"nmcAddress"`
 }
 
 type BlockDetailsResponse struct {
@@ -100,7 +85,7 @@ type BlockDetailsResponse struct {
 
 type TransactionDetailsResponse struct {
 	BlockHash        string `json:"blockHash"`
-	BlockNumber      int64  `json:"blockNumbe"`
+	BlockNumber      int64  `json:"blockNumber"`
 	From             string `json:"from"`
 	Gas              int64  `json:"gas"`
 	GasPrice         int64  `json:"gasPrice"`
@@ -180,6 +165,7 @@ type CreateNetworkScriptArgs struct {
 	RPCPort           string `json:"rpcPort,omitempty"`
 	WhisperPort       string `json:"whisperPort,omitempty"`
 	ConstellationPort string `json:"constellationPort,omitempty"`
+	RaftPort          string `json:"raftPort,omitempty"`
 	NodeManagerPort   string `json:"nodeManagerPort,omitempty"`
 }
 
@@ -189,6 +175,7 @@ type JoinNetworkScriptArgs struct {
 	RPCPort               string `json:"rpcPort,omitempty"`
 	WhisperPort           string `json:"whisperPort,omitempty"`
 	ConstellationPort     string `json:"constellationPort,omitempty"`
+	RaftPort              string `json:"raftPort,omitempty"`
 	NodeManagerPort       string `json:"nodeManagerPort,omitempty"`
 	MasterNodeManagerPort string `json:"masterNodeManagerPort,omitempty"`
 	MasterIP              string `json:"masterIP,omitempty"`
@@ -229,17 +216,7 @@ type LatencyResponse struct {
 }
 
 type NodeServiceImpl struct {
-	Url                      string
-	PowerChainContractClient     *powerchainScClient.ContractClient
-	NodeAccAddress           string
-	MiningRegisteredChan     chan struct{}
-	MiningRegistered         bool
-	NotaryPeriod             int64
-	Nms                      *contractclient.NetworkMapContractClient
-	LastInternalNotary       int64
-	LastPowerChainScNotaryBlock  int64
-	LastProcessedNotaryBlock int64
-	NotaryInvokedCounter     uint32
+	Url string
 }
 
 type ChartInfo struct {
@@ -299,36 +276,6 @@ var warning = 0
 var lastCrawledBlock = 0
 var mailServerConfig MailServerConfig
 
-func NewNodeServiceImpl(url string, powerchainContractClient *powerchainScClient.ContractClient, nodeAccAddress string, nms *contractclient.NetworkMapContractClient) (*NodeServiceImpl, error) {
-	neNodeServiceImpl := new(NodeServiceImpl)
-
-	chainStaticDetails, err := powerchainContractClient.GetChainStaticDetails()
-	if err != nil {
-		return nil, err
-	}
-	neNodeServiceImpl.NotaryPeriod = chainStaticDetails.NotaryPeriod.Int64()
-
-	neNodeServiceImpl.Url = url
-	neNodeServiceImpl.PowerChainContractClient = powerchainContractClient
-	neNodeServiceImpl.NodeAccAddress = nodeAccAddress
-	neNodeServiceImpl.Nms = nms
-	neNodeServiceImpl.MiningRegistered = true
-	neNodeServiceImpl.MiningRegisteredChan = nil
-	neNodeServiceImpl.LastInternalNotary = 0
-	neNodeServiceImpl.LastPowerChainScNotaryBlock = 0
-	neNodeServiceImpl.LastProcessedNotaryBlock = 0
-	neNodeServiceImpl.NotaryInvokedCounter = 0
-
-	return neNodeServiceImpl, nil
-}
-
-func (nsi *NodeServiceImpl) ethProposeValidator(url string, validatorAddress string, vote bool) error {
-	var nodeUrl = url
-	ethClient := client.EthClient{nodeUrl}
-
-	return ethClient.ProposeValidator(validatorAddress, vote)
-}
-
 func (nsi *NodeServiceImpl) getGenesis(url string) (response GetGenesisResponse) {
 	var netId, constl string
 	existsA := util.PropertyExists("NETWORK_ID", "/home/setup.conf")
@@ -349,25 +296,36 @@ func (nsi *NodeServiceImpl) getGenesis(url string) (response GetGenesisResponse)
 	return response
 }
 
-func (nsi *NodeServiceImpl) getNmcAddress() (response GetNmcAddressResponse) {
+func (nsi *NodeServiceImpl) joinNetwork(enode string, url string) string {
+	var nodeUrl = url
+	ethClient := client.EthClient{nodeUrl}
+	raftId := ethClient.RaftAddPeer(enode)
 	var contractAdd string
 	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
 	if exists != "" {
 		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
 		contractAdd = util.MustGetString("CONTRACT_ADD", p)
 	}
-	response = GetNmcAddressResponse{contractAdd}
-	return response
+	collatedInfo := fmt.Sprint(raftId, ":", contractAdd)
+	return collatedInfo
 }
 
 //@TODO: If this function is repeatedly called from UI, please cache the static informations.
 func (nsi *NodeServiceImpl) getCurrentNode(url string) NodeInfo {
 	var nodeUrl = url
 	ethClient := client.EthClient{nodeUrl}
+	fromAddress := ethClient.Coinbase()
+	var contractAdd string
+	var p *properties.Properties
+	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
+	if exists != "" {
+		p = properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		contractAdd = util.MustGetString("CONTRACT_ADD", p)
+	}
 
-	nsi.InitInternalContract(url)
+	nms := contractclient.NetworkMapContractClient{client.EthClient{url}, contracthandler.ContractParam{fromAddress, contractAdd, "", nil}}
 
-	totalCount := nsi.Nms.GetNodeCount()
+	totalCount := len(nms.GetNodeDetailsList())
 	var activeStatus string
 	active := ethClient.NetListening()
 	if active == true {
@@ -399,17 +357,22 @@ func (nsi *NodeServiceImpl) getCurrentNode(url string) NodeInfo {
 	nodename = strings.TrimSuffix(nodename, ".sh")
 	nodename = strings.TrimPrefix(nodename, "start_")
 
-	var ipAddr, rpcPort, nodeName string
-	var p *properties.Properties
-	p = properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+	var ipAddr, raftId, rpcPort, nodeName string
 	existsA := util.PropertyExists("CURRENT_IP", "/home/setup.conf")
+	existsB := util.PropertyExists("RAFT_ID", "/home/setup.conf")
 	existsC := util.PropertyExists("RPC_PORT", "/home/setup.conf")
 	existsD := util.PropertyExists("NODENAME", "/home/setup.conf")
-	if existsA != "" && existsC != "" && existsD != "" {
+	if existsA != "" && existsB != "" && existsC != "" && existsD != "" {
 		ipAddr = util.MustGetString("CURRENT_IP", p)
+		raftId = util.MustGetString("RAFT_ID", p)
 		rpcPort = util.MustGetString("RPC_PORT", p)
 		nodeName = util.MustGetString("NODENAME", p)
 	}
+	raftIdInt, err := strconv.Atoi(raftId)
+	if err != nil {
+		log.Println(err)
+	}
+
 	rpcPortInt, err := strconv.Atoi(rpcPort)
 	if err != nil {
 		log.Println(err)
@@ -424,14 +387,20 @@ func (nsi *NodeServiceImpl) getCurrentNode(url string) NodeInfo {
 	blockNumber := ethClient.BlockNumber()
 	blockNumberInt := util.HexStringtoInt64(blockNumber)
 
-	role := util.MustGetString("ROLE", p)
-	chainId, err := strconv.Atoi(util.MustGetString("CHAIN_ID", p))
+	raftRole := ethClient.RaftRole()
+
+	raftRole = strings.TrimSuffix(raftRole, "\n")
+
+	b, err := ioutil.ReadFile("/home/node/genesis.json")
+
 	if err != nil {
-		log.Println(err)
+		//log.Println(err)
 	}
 
+	genesis := string(b)
+	genesis = strings.Replace(genesis, "\n", "", -1)
 	conn := ConnectionInfo{ipAddr, rpcPortInt, enode}
-	responseObj := NodeInfo{nodeName, count, totalCount, activeStatus, conn, role, blockNumberInt, pendingTxCount, thisAdminInfo, chainId}
+	responseObj := NodeInfo{nodeName, count, totalCount, activeStatus, conn, raftRole, raftIdInt, blockNumberInt, pendingTxCount, genesis, thisAdminInfo}
 	return responseObj
 }
 
@@ -479,7 +448,8 @@ func (nsi *NodeServiceImpl) getBlockInfo(blockno int64, url string) BlockDetails
 	blockResponseClient := ethClient.GetBlockByNumber(bNoHex)
 	currentTime := time.Now().Unix()
 	creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-	elapsedTime := currentTime - creationTime
+	creationTimeUnix := creationTime / 1000000000
+	elapsedTime := currentTime - creationTimeUnix
 	blockResponse.TimeElapsed = elapsedTime
 
 	//@TODO: Create a utility function to convert block object to readable object.
@@ -505,7 +475,7 @@ func (nsi *NodeServiceImpl) getBlockInfo(blockno int64, url string) BlockDetails
 	for i, clientTransactions := range blockResponseClient.Transactions {
 
 		txGetClient := ethClient.GetTransactionByHash(clientTransactions.Hash)
-		private := ethClient.GetQuorumPayload(txGetClient.Input)
+		private := ethClient.GetPowerChainPayload(txGetClient.Input)
 		txResponse[i] = ConvertToReadable(clientTransactions, false, (private == "0x"))
 
 	}
@@ -541,7 +511,8 @@ func (nsi *NodeServiceImpl) getLatestBlockInfo(count string, reference string, u
 		blockResponse[blockNumber-i].Hash = blockResponseClient.Hash
 		currentTime := time.Now().Unix()
 		creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-		elapsedTime := currentTime - creationTime
+		creationTimeUnix := creationTime / 1000000000
+		elapsedTime := currentTime - creationTimeUnix
 		blockResponse[blockNumber-i].TimeElapsed = elapsedTime
 		txnNo := len(blockResponseClient.Transactions)
 		txResponse := make([]TransactionDetailsResponse, txnNo)
@@ -549,7 +520,7 @@ func (nsi *NodeServiceImpl) getLatestBlockInfo(count string, reference string, u
 		for i, clientTransactions := range blockResponseClient.Transactions {
 
 			txGetClient := ethClient.GetTransactionByHash(clientTransactions.Hash)
-			private := ethClient.GetQuorumPayload(txGetClient.Input)
+			private := ethClient.GetPowerChainPayload(txGetClient.Input)
 			txResponse[i] = ConvertToReadable(clientTransactions, false, (private == "0x"))
 
 		}
@@ -573,7 +544,8 @@ func (nsi *NodeServiceImpl) getLatestTransactionInfo(count string, url string) [
 		blockResponseClient := ethClient.GetBlockByNumber(bNoHex)
 		currentTime := time.Now().Unix()
 		creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-		elapsedTime := currentTime - creationTime
+		creationTimeUnix := creationTime / 1000000000
+		elapsedTime := currentTime - creationTimeUnix
 		blockResponse[blockNumber-i].TimeElapsed = elapsedTime
 		blockResponse[blockNumber-i].Number = util.HexStringtoInt64(blockResponseClient.Number)
 		txnNo := len(blockResponseClient.Transactions)
@@ -582,7 +554,7 @@ func (nsi *NodeServiceImpl) getLatestTransactionInfo(count string, url string) [
 		for i, clientTransactions := range blockResponseClient.Transactions {
 
 			txGetClient := ethClient.GetTransactionByHash(clientTransactions.Hash)
-			private := ethClient.GetQuorumPayload(txGetClient.Input)
+			private := ethClient.GetPowerChainPayload(txGetClient.Input)
 			txResponse[i] = ConvertToReadable(clientTransactions, false, (private == "0x"))
 
 		}
@@ -598,26 +570,29 @@ func (nsi *NodeServiceImpl) getTransactionInfo(txno string, url string) Transact
 	var txResponse TransactionDetailsResponse
 	txResponseClient := ethClient.GetTransactionByHash(txno)
 
-	private := ethClient.GetQuorumPayload(txResponseClient.Input)
+	private := ethClient.GetPowerChainPayload(txResponseClient.Input)
 	txResponse = ConvertToReadable(txResponseClient, false, (private == "0x"))
 
 	blockResponseClient := ethClient.GetBlockByNumber(txResponseClient.BlockNumber)
 	currentTime := time.Now().Unix()
 	creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-	elapsedTime := currentTime - creationTime
+	creationTimeUnix := creationTime / 1000000000
+	elapsedTime := currentTime - creationTimeUnix
 	txResponse.TimeElapsed = elapsedTime
 	return txResponse
 }
 
 func (nsi *NodeServiceImpl) getTransactionReceipt(txno string, url string) TransactionReceiptResponse {
-	//if txnMap[txno].TransactionHash == "" {
-	log.Println("getTransactionReceipt: called with params txno: " + txno + "; url: " + url)
-	txResponse := populateTransactionObject(txno, url)
-	log.Println("getTransactionReceipt: populateTransactionObject returned ", txResponse)
-	decodeTransactionObject(&txResponse, url)
-	log.Println("getTransactionReceipt: decodeTransactionObject returned ", txResponse)
-
-	return txResponse
+	if txnMap[txno].TransactionHash == "" {
+		txResponse := populateTransactionObject(txno, url)
+		decodeTransactionObject(&txResponse, url)
+		return txResponse
+	} else {
+		txnDetails := txnMap[txno]
+		calculateTimeElapsed(&txnDetails, url)
+		txnMap[txno] = txnDetails
+		return txnDetails
+	}
 }
 
 func populateTransactionObject(txno string, url string) TransactionReceiptResponse {
@@ -660,21 +635,20 @@ func populateTransactionObject(txno string, url string) TransactionReceiptRespon
 	blockResponseClient := ethClient.GetBlockByNumber(getTransactionReceipt.BlockNumber)
 	currentTime := time.Now().Unix()
 	creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-	elapsedTime := currentTime - creationTime
+	creationTimeUnix := creationTime / 1000000000
+	elapsedTime := currentTime - creationTimeUnix
 	txResponse.TimeElapsed = elapsedTime
 	return txResponse
 }
 
 func decodeTransactionObject(txnDetails *TransactionReceiptResponse, url string) {
 	var powerchainPayload string
-	//var decoded bool
+	var decoded bool
 
 	ethClient := client.EthClient{url}
 
 	if util.HexStringtoInt64(txnDetails.V) == 37 || util.HexStringtoInt64(txnDetails.V) == 38 {
-		log.Println("decodeTransactionObject: processing powerchain private transaction, calling ethClient.GetQuorumPayload with param ", txnDetails.Input)
-		powerchainPayload = ethClient.GetQuorumPayload(txnDetails.Input)
-		log.Println("decodeTransactionObject: ethClient.GetQuorumPayload returned ", powerchainPayload)
+		powerchainPayload = ethClient.GetPowerChainPayload(txnDetails.Input)
 		if powerchainPayload == "0x" {
 			txnDetails.TransactionType = "Hash Only"
 		} else {
@@ -698,7 +672,7 @@ func decodeTransactionObject(txnDetails *TransactionReceiptResponse, url string)
 			}
 			if functionDetails != "" {
 				txnDetails.FunctionDetails = functionDetails
-				//decoded = true
+				decoded = true
 			}
 		} else if txnDetails.TransactionType == "Public" && abiMap[txnDetails.To] != "" && abiMap[txnDetails.To] != "missing" {
 			decodedData, functionDetails := contractclient.ABIParser(txnDetails.To, abiMap[txnDetails.To], txnDetails.Input)
@@ -712,21 +686,21 @@ func decodeTransactionObject(txnDetails *TransactionReceiptResponse, url string)
 			}
 			if functionDetails != "" {
 				txnDetails.FunctionDetails = functionDetails
-				//decoded = true
+				decoded = true
 			}
 		} else if txnDetails.TransactionType == "Hash Only" {
 			var decodeFail DecodeFailure
 			decodeFail.Label = "Hash Only Transaction"
 			decodeFail.Type = "red"
 			txnDetails.DecodeFailed = decodeFail
-			//decoded = true
+			decoded = true
 		} else if abiMap[txnDetails.To] == "" {
 			if txnDetails.Input == "0x" && txnDetails.Value != 0 {
 				var decodeFail DecodeFailure
 				decodeFail.Label = "Ether Transfer"
 				decodeFail.Type = "yellow"
 				txnDetails.DecodeFailed = decodeFail
-				//decoded = true
+				decoded = true
 			} else {
 				var decodeFail DecodeFailure
 				decodeFail.Label = "Decode in Progress"
@@ -740,6 +714,10 @@ func decodeTransactionObject(txnDetails *TransactionReceiptResponse, url string)
 			txnDetails.DecodeFailed = decodeFail
 		}
 	}
+
+	if decoded {
+		txnMap[txnDetails.TransactionHash] = *txnDetails
+	}
 }
 
 func calculateTimeElapsed(txnDetails *TransactionReceiptResponse, url string) {
@@ -748,12 +726,14 @@ func calculateTimeElapsed(txnDetails *TransactionReceiptResponse, url string) {
 	blockResponseClient := ethClient.GetBlockByNumber(getTransactionReceipt.BlockNumber)
 	currentTime := time.Now().Unix()
 	creationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
-	elapsedTime := currentTime - creationTime
+	creationTimeUnix := creationTime / 1000000000
+	elapsedTime := currentTime - creationTimeUnix
 	txnDetails.TimeElapsed = elapsedTime
 }
 
 func (nsi *NodeServiceImpl) joinRequestResponse(enode string, status string) SuccessResponse {
 	var successResponse SuccessResponse
+	peerMap[enode] = status
 	var enodeString []string
 	var ipString []string
 
@@ -769,17 +749,26 @@ func (nsi *NodeServiceImpl) joinRequestResponse(enode string, status string) Suc
 func (nsi *NodeServiceImpl) deployContract(pubKeys []string, fileName []string, private bool, url string) []ContractJson {
 	var nodeUrl = url
 	ethClient := client.EthClient{nodeUrl}
+	fromAddress := ethClient.Coinbase()
 
+	//@TODO: Dont use absolute paths
+	var contractAdd string
+	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
+	if exists != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		contractAdd = util.MustGetString("CONTRACT_ADD", p)
+	}
+	nms := contractclient.NetworkMapContractClient{client.EthClient{url}, contracthandler.ContractParam{fromAddress, contractAdd, "", nil}}
 	if private == true && pubKeys[0] == "" {
-		nsi.InitInternalContract(url)
 		enode := ethClient.AdminNodeInfo().ID
-		peerNo := nsi.Nms.GetNodeCount()
+		peerNo := len(nms.GetNodeDetailsList())
 		publicKeys := make([]string, peerNo-1)
 		for i := 0; i < peerNo; i++ {
-			if enode != nsi.Nms.GetNodeDetails(i).Enode {
-				publicKeys[i-1] = nsi.Nms.GetNodeDetails(i).PublicKey
+			if enode != nms.GetNodeDetails(i).Enode {
+				publicKeys[i-1] = nms.GetNodeDetails(i).PublicKey
 			}
 		}
+		//pubKeys = []string{"R1fOFUfzBbSVaXEYecrlo9rENW0dam0kmaA2pasGM14=", "Er5J8G+jXQA9O2eu7YdhkraYM+j+O5ArnMSZ24PpLQY="}
 		pubKeys = publicKeys
 	}
 	var solc string
@@ -840,7 +829,7 @@ func (nsi *NodeServiceImpl) deployContract(pubKeys []string, fileName []string, 
 			start = start + 2
 			if j != (len(contractBytecodesAll) - 1) {
 				delimiter := reEnd.FindStringIndex(bytecode)
-				thisContractBytecode = bytecode[start : delimiter[1]-1]
+				thisContractBytecode = bytecode[start: delimiter[1]-1]
 			} else {
 				thisContractBytecode = bytecode[start:]
 			}
@@ -891,7 +880,7 @@ func (nsi *NodeServiceImpl) deployContract(pubKeys []string, fileName []string, 
 			start = start + 2
 			if j != (len(contractABIAll) - 1) {
 				delimiter := reEnd.FindStringIndex(abiString)
-				thisContractABI = abiString[start : delimiter[1]-1]
+				thisContractABI = abiString[start: delimiter[1]-1]
 			} else {
 				thisContractABI = abiString[start:]
 			}
@@ -940,6 +929,94 @@ func (nsi *NodeServiceImpl) deployContract(pubKeys []string, fileName []string, 
 	return contractJsonArr
 }
 
+func (nsi *NodeServiceImpl) createNetworkScriptCall(nodename string, currentIP string, rpcPort string, whisperPort string, constellationPort string, raftPort string, nodeManagerPort string) SuccessResponse {
+	var successResponse SuccessResponse
+	cmd := exec.Command("./setup.sh", "1", nodename)
+	cmd.Dir = "./Setup"
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		log.Println(err)
+	}
+
+	var setupConf string
+	setupConf = "CURRENT_IP=" + currentIP + "\n" + "RPC_PORT=" + rpcPort + "\n" + "WHISPER_PORT=" + whisperPort + "\n" + "CONSTELLATION_PORT=" + constellationPort + "\n" + "RAFT_PORT=" + raftPort + "\n" + "NODEMANAGER_PORT=" + nodeManagerPort + "\n"
+	setupConfByte := []byte(setupConf)
+	err = ioutil.WriteFile("./Setup/"+nodename+"/setup.conf", setupConfByte, 0775)
+	if err != nil {
+		fmt.Println(err)
+	}
+	successResponse.Status = "success"
+	return successResponse
+}
+
+func (nsi *NodeServiceImpl) joinRequestResponseCall(nodename string, currentIP string, rpcPort string, whisperPort string, constellationPort string, raftPort string, nodeManagerPort string, masterNodeManagerPort string, masterIP string) SuccessResponse {
+	var successResponse SuccessResponse
+	cmd := exec.Command("./setup.sh", "2", nodename, masterIP, masterNodeManagerPort, currentIP, rpcPort, whisperPort, constellationPort, raftPort, nodeManagerPort)
+	cmd.Dir = "./Setup"
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		log.Println(err)
+	}
+
+	var setupConf string
+	setupConf = "CURRENT_IP=" + currentIP + "\n" + "RPC_PORT=" + rpcPort + "\n" + "WHISPER_PORT=" + whisperPort + "\n" + "CONSTELLATION_PORT=" + constellationPort + "\n" + "RAFT_PORT=" + raftPort + "\n" + "THIS_NODEMANAGER_PORT=" + nodeManagerPort + "\n" + "MASTER_IP=" + masterIP + "\n" + "NODEMANAGER_PORT=" + masterNodeManagerPort + "\n"
+	setupConfByte := []byte(setupConf)
+	err = ioutil.WriteFile("./Setup/"+nodename+"/setup.conf", setupConfByte, 0775)
+	if err != nil {
+		fmt.Println(err)
+	}
+	successResponse.Status = "success"
+	return successResponse
+}
+
+func (nsi *NodeServiceImpl) resetCurrentNode() SuccessResponse {
+	var successResponse SuccessResponse
+	cmd := exec.Command("./reset_chain.sh")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	if err != nil {
+		log.Println(err)
+		successResponse.Status = "failure"
+		return successResponse
+	}
+	successResponse.Status = "success"
+	return successResponse
+}
+
+func (nsi *NodeServiceImpl) restartCurrentNode() SuccessResponse {
+	var successResponse SuccessResponse
+	r, _ := regexp.Compile("[s][t][a][r][t][_][A-Za-z0-9]*[.][s][h]")
+	files, err := ioutil.ReadDir("/home/node")
+	if err != nil {
+		log.Println(err)
+	}
+	var filename string
+	for _, f := range files {
+		match, _ := regexp.MatchString("[s][t][a][r][t][_][A-Za-z0-9]*[.][s][h]", f.Name())
+		if match {
+			filename = r.FindString(f.Name())
+		}
+	}
+	filepath := fmt.Sprint("./", filename)
+	cmd := exec.Command(filepath)
+	cmd.Dir = "/home/node"
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err = cmd.Start()
+	if err != nil {
+		log.Println(err)
+		successResponse.Status = "failure"
+		return successResponse
+	}
+	successResponse.Status = "success"
+	return successResponse
+}
+
 func (nsi *NodeServiceImpl) latestBlockDetails(url string) LatestBlockResponse {
 	var latestBlockResponse LatestBlockResponse
 	var nodeUrl = url
@@ -950,21 +1027,68 @@ func (nsi *NodeServiceImpl) latestBlockDetails(url string) LatestBlockResponse {
 	blockNumberInt := util.HexStringtoInt64(blockNumber)
 	creationTime := blockResponseClient.Timestamp
 	creationTimeInt := util.HexStringtoInt64(creationTime)
-	elapsedTime := currentTime - creationTimeInt
+	creationTimeUnix := creationTimeInt / 1000000000
+	elapsedTime := currentTime - creationTimeUnix
 	latestBlockResponse.LatestBlockNumber = blockNumberInt
 	latestBlockResponse.TimeElapsed = elapsedTime
 	return latestBlockResponse
 }
 
-func (nsi *NodeServiceImpl) latency(url string) []LatencyResponse {
-	nsi.InitInternalContract(url)
+//func (nsi *NodeServiceImpl) latency(url string) ([]LatencyResponse) {
+//	var nodeUrl = url
+//	ethClient := client.EthClient{nodeUrl}
+//	otherPeersResponse := ethClient.AdminPeers()
+//	peerCount := len(otherPeersResponse)
+//	latencyResponse := make([]LatencyResponse, peerCount+1)
+//	for i := 0; i < peerCount+1; i++ {
+//		var latOut bytes.Buffer
+//		var ip string
+//		if i == peerCount {
+//			ip = "localhost"
+//			thisAdminInfo := ethClient.AdminNodeInfo()
+//			latencyResponse[i].EnodeID = thisAdminInfo.ID
+//		} else {
+//			ip = otherPeersResponse[i].Network.LocalAddress
+//			ipString := strings.Split(ip, ":")
+//			ip = ipString[0]
+//			latencyResponse[i].EnodeID = otherPeersResponse[i].ID
+//		}
+//		command := fmt.Sprint("ping -c 4 ", ip, " |  awk -F'/' '{ print $5 }' | tail -1")
+//		cmd := exec.Command("bash", "-c", command)
+//		cmd.Stdout = &latOut
+//		err := cmd.Run()
+//		if err != nil {
+//			fmt.Println(err)
+//		}
+//		latencyString := strings.TrimSuffix(latOut.String(), "\n")
+//		latency, err := strconv.ParseFloat(latencyString, 10)
+//		latency = latency * 1000
+//		latencyStr := strconv.FormatFloat(latency, 'f', 0, 64)
+//		latencyResponse[i].Latency = latencyStr
+//	}
+//	return latencyResponse
+//}
 
-	peerNo := nsi.Nms.GetNodeCount()
+func (nsi *NodeServiceImpl) latency(url string) []LatencyResponse {
+	var nodeUrl = url
+	ethClient := client.EthClient{nodeUrl}
+	fromAddress := ethClient.Coinbase()
+	var contractAdd string
+	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
+	if exists != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		contractAdd = util.MustGetString("CONTRACT_ADD", p)
+	}
+
+	nms := contractclient.NetworkMapContractClient{client.EthClient{url}, contracthandler.ContractParam{fromAddress, contractAdd, "", nil}}
+
+	peerNo := len(nms.GetNodeDetailsList())
+
 	latencyResponse := make([]LatencyResponse, peerNo)
 	for i := 0; i < peerNo; i++ {
 		var latOut bytes.Buffer
-		ip := nsi.Nms.GetNodeDetails(i).IP
-		latencyResponse[i].EnodeID = nsi.Nms.GetNodeDetails(i).Enode
+		ip := nms.GetNodeDetails(i).IP
+		latencyResponse[i].EnodeID = nms.GetNodeDetails(i).Enode
 		command := fmt.Sprint("ping -c 4 ", ip, " |  awk -F'/' '{ print $5 }' | tail -1")
 		cmd := exec.Command("bash", "-c", command)
 		cmd.Stdout = &latOut
@@ -988,6 +1112,105 @@ func (nsi *NodeServiceImpl) transactionSearchDetails(txno string, url string) Bl
 	blockNumber := util.HexStringtoInt64(txGetClient.BlockNumber)
 	blockDetailsResponse := nsi.getBlockInfo(blockNumber, url)
 	return blockDetailsResponse
+}
+
+func (nsi *NodeServiceImpl) emailServerConfig(host string, port string, username string, password string, recipientList string, url string) SuccessResponse {
+	var successResponse SuccessResponse
+
+	mailServerConfig.Host = host
+	mailServerConfig.Port = port
+	mailServerConfig.Username = username
+	mailServerConfig.Password = password
+	mailServerConfig.RecipientList = recipientList
+
+	registered := fmt.Sprint("RECIPIENTLIST=", recipientList, "\n")
+	util.AppendStringToFile("/home/setup.conf", registered)
+
+	ticker := time.NewTicker(30 * time.Second)
+	go func() {
+		for range ticker.C {
+			//fmt.Println("Healthcheck done at: ", t)
+			if warning > 0 {
+				//fmt.Println("Ticker stopped")
+				ticker.Stop()
+			}
+			nsi.healthCheck(url)
+
+		}
+	}()
+	go func() {
+		nsi.sendTestMail()
+	}()
+	successResponse.Status = "success"
+	return successResponse
+}
+
+func (nsi *NodeServiceImpl) healthCheck(url string) {
+	ethClient := client.EthClient{url}
+	blockNumber := ethClient.BlockNumber()
+	if blockNumber == "" {
+		if warning > 0 {
+			exists := util.PropertyExists("RECIPIENTLIST", "/home/setup.conf")
+			if exists != "" {
+				p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+				recipientList := util.MustGetString("RECIPIENTLIST", p)
+				recipients := strings.Split(recipientList, ",")
+
+				b, err := ioutil.ReadFile("/root/powerchain-maker/NodeUnavailableTemplate.txt")
+
+				if err != nil {
+					log.Println(err)
+				}
+
+				mailCont := string(b)
+				mailCont = strings.Replace(mailCont, "\n", "", -1)
+				for i := 0; i < len(recipients); i++ {
+					nsi.sendMail(mailServerConfig.Host, mailServerConfig.Port, mailServerConfig.Username, mailServerConfig.Password, "Node is not responding", mailCont, recipients[i])
+				}
+			}
+		}
+		warning++
+	}
+}
+
+func (nsi *NodeServiceImpl) sendTestMail() {
+	existsA := util.PropertyExists("RECIPIENTLIST", "/home/setup.conf")
+	existsB := util.PropertyExists("NODENAME", "/home/setup.conf")
+
+	if existsA != "" && existsB != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		nodename := util.MustGetString("NODENAME", p)
+		recipientList := util.MustGetString("RECIPIENTLIST", p)
+		recipients := strings.Split(recipientList, ",")
+		b, err := ioutil.ReadFile("/root/powerchain-maker/TestMailTemplate.txt")
+		if err != nil {
+			log.Println(err)
+		}
+
+		mailCont := string(b)
+		message := fmt.Sprintf(mailCont, nodename)
+		for i := 0; i < len(recipients); i++ {
+			nsi.sendMail(mailServerConfig.Host, mailServerConfig.Port, mailServerConfig.Username, mailServerConfig.Password, "PowerChain Maker Notification Service configured", message, recipients[i])
+		}
+	}
+}
+
+func (nsi *NodeServiceImpl) sendMail(host string, port string, username string, password string, subject string, mailContent string, to string) {
+	portNo, err := strconv.ParseInt(port, 10, 64)
+	if err != nil {
+		fmt.Println(err)
+	}
+	m := gomail.NewMessage()
+	m.SetHeader("From", username)
+	m.SetHeader("To", to)
+	m.SetHeader("Subject", subject)
+	m.SetBody("text", mailContent)
+
+	d := gomail.NewDialer(host, int(portNo), username, password)
+
+	if err := d.DialAndSend(m); err != nil {
+		log.Println(err)
+	}
 }
 
 //@TODO: Implement logrotate command to do this.
@@ -1035,6 +1258,10 @@ func (nsi *NodeServiceImpl) LogRotaterConst() {
 }
 
 func (nsi *NodeServiceImpl) RegisterNodeDetails(url string) {
+	mode := currentMode()
+	if mode == "PASSIVE" || mode == "ACTIVENI" {
+		return
+	}
 	var nodeUrl = url
 	var registeredVal string
 	exists := util.PropertyExists("REGISTERED", "/home/setup.conf")
@@ -1046,41 +1273,37 @@ func (nsi *NodeServiceImpl) RegisterNodeDetails(url string) {
 		ethClient := client.EthClient{nodeUrl}
 
 		enode := ethClient.AdminNodeInfo().ID
-		var ipAddr, nodename, pubKey, role string
+		fromAddress := ethClient.Coinbase()
+		var ipAddr, nodename, pubKey, role, id, contractAdd string
 		existsA := util.PropertyExists("CURRENT_IP", "/home/setup.conf")
 		existsB := util.PropertyExists("NODENAME", "/home/setup.conf")
 		existsC := util.PropertyExists("PUBKEY", "/home/setup.conf")
 		existsD := util.PropertyExists("ROLE", "/home/setup.conf")
-		if existsA != "" && existsB != "" && existsC != "" && existsD != "" {
+		existsE := util.PropertyExists("RAFT_ID", "/home/setup.conf")
+		existsF := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
+		if existsA != "" && existsB != "" && existsC != "" && existsD != "" && existsE != "" && existsF != "" {
 			p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
 			ipAddr = util.MustGetString("CURRENT_IP", p)
 			nodename = util.MustGetString("NODENAME", p)
 			pubKey = util.MustGetString("PUBKEY", p)
 			role = util.MustGetString("ROLE", p)
+			id = util.MustGetString("RAFT_ID", p)
+			contractAdd = util.MustGetString("CONTRACT_ADD", p)
 		}
 		registered := fmt.Sprint("REGISTERED=TRUE", "\n")
 		util.AppendStringToFile("/home/setup.conf", registered)
 		util.DeleteProperty("REGISTERED=", "/home/setup.conf")
-		nsi.InitInternalContract(url)
-		var tx string
-
-		var timeOutSecs uint = 1
-		var maxTimeOutSesc uint = 24 * 60 * 60 // 24 hours
-		for tx == "" {
-			time.Sleep(time.Duration(timeOutSecs * 1000000000 /* nanoseconds*/))
-			tx = nsi.Nms.RegisterNode(nodename, role, pubKey, enode, ipAddr)
-
-			if timeOutSecs > maxTimeOutSesc {
-				log.Fatal("Unable to register node after ", maxTimeOutSesc, " seconds")
-			}
-			timeOutSecs *= 2
-		}
-
-		log.Info("Node registered on Network Manager contract")
+		util.DeleteProperty("ROLE=Unassigned", "/home/setup.conf")
+		nms := contractclient.NetworkMapContractClient{client.EthClient{url}, contracthandler.ContractParam{fromAddress, contractAdd, "", nil}}
+		nms.RegisterNode(nodename, role, pubKey, enode, ipAddr, id)
 	}
 }
 
 func (nsi *NodeServiceImpl) NetworkManagerContractDeployer(url string) {
+	mode := currentMode()
+	if mode == "PASSIVE" || mode == "ACTIVENI" {
+		return
+	}
 	var contractAdd string
 	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
 	if exists != "" {
@@ -1095,12 +1318,7 @@ func (nsi *NodeServiceImpl) NetworkManagerContractDeployer(url string) {
 		contAddAppend := fmt.Sprint("CONTRACT_ADD=", contAdd, "\n")
 		util.AppendStringToFile("/home/setup.conf", contAddAppend)
 		util.DeleteProperty("CONTRACT_ADD=", "/home/setup.conf")
-
-		// Wait after deploying internal SC and before calling it again(registering node) so
-		// the second tx does not get rejected on the node level because of validator free allowed tx limit
-		time.Sleep(5 * time.Second)
 	}
-	nsi.InitInternalContract(url)
 }
 
 func ConvertToReadable(p client.TransactionDetailsResponse, pending bool, hash bool) TransactionDetailsResponse {
@@ -1159,7 +1377,8 @@ func (nsi *NodeServiceImpl) GetChartData(url string) []ChartInfo {
 	lastBlockNoHex := strconv.FormatInt(currentBlockNumber, 16)
 	lastBNoHex := fmt.Sprint("0x", lastBlockNoHex)
 	blockResponseClient := ethClient.GetBlockByNumber(lastBNoHex)
-	lastCreationTime := util.HexStringtoInt64(blockResponseClient.Timestamp)
+	lastCreationTimeRaw := util.HexStringtoInt64(blockResponseClient.Timestamp)
+	lastCreationTime := lastCreationTimeRaw / 1000000000
 	lastCreationTimeSec := lastCreationTime - (lastCreationTime % 60)
 	if lastCreationTimeSec > stopTime {
 		for currentTime > stopTime {
@@ -1170,6 +1389,7 @@ func (nsi *NodeServiceImpl) GetChartData(url string) []ChartInfo {
 				bNoHex := fmt.Sprint("0x", blockNoHex)
 				blockResponseClient := ethClient.GetBlockByNumber(bNoHex)
 				creationTimeRaw := util.HexStringtoInt64(blockResponseClient.Timestamp)
+				creationTimeRaw = creationTimeRaw / 1000000000
 				currentTime = creationTimeRaw - (creationTimeRaw % 60)
 				if currentTime > bucketTime {
 					currentBlockNumber = currentBlockNumber - 1
@@ -1226,20 +1446,56 @@ func (nsi *NodeServiceImpl) getContracts(url string) {
 				}
 
 				if util.HexStringtoInt64(clientTransactions.V) == 37 || util.HexStringtoInt64(clientTransactions.V) == 38 {
-					private := ethClient.GetQuorumPayload(clientTransactions.Input)
+					private := ethClient.GetPowerChainPayload(clientTransactions.Input)
 					if private == "0x" {
 						contTypeMap[txGetClient.ContractAddress] = "Hash Only"
 					} else {
 						contTypeMap[txGetClient.ContractAddress] = "Private"
 					}
+				} else {
+					contTypeMap[txGetClient.ContractAddress] = "Public"
+					mode := currentMode()
+					if mode == "ACTIVENI" {
+						nsi.attachModeRegisterDetails(url, txGetClient.ContractAddress)
+					}
 				}
 				contSenderMap[txGetClient.ContractAddress] = clientTransactions.From
-				contTimeMap[txGetClient.ContractAddress] = strconv.Itoa(int(util.HexStringtoInt64(blockResponseClient.Timestamp)))
+				contTimeMap[txGetClient.ContractAddress] = strconv.Itoa(int(util.HexStringtoInt64(blockResponseClient.Timestamp) / 1000000000))
 			}
 		}
 	}
+	mode := currentMode()
+	if mode == "ACTIVENI" {
+		util.DeleteProperty("MODE=ACTIVENI", "/home/setup.conf")
+		modeActive := fmt.Sprint("MODE=ACTIVE\n")
+		util.AppendStringToFile("/home/setup.conf", modeActive)
+		nsi.NetworkManagerContractDeployer(url)
+		nsi.RegisterNodeDetails(url)
+	}
 	lastCrawledBlock = blockNumber
 	contractCrawlerMutex = 0
+}
+
+func (nsi *NodeServiceImpl) attachModeRegisterDetails(url string, contractAdd string) {
+	nmcBytecode, err := ioutil.ReadFile("/root/powerchain-maker/nmcBytecode")
+	if err != nil {
+		log.Println(err)
+	}
+	nmcBytecodeString := string(nmcBytecode)
+	nmcBytecodeString = strings.Replace(nmcBytecodeString, "\n", "", -1)
+	ethClient := client.EthClient{url}
+	bytecode := ethClient.GetCode(contractAdd)
+	hashIndex := len(bytecode) - 68
+	bytecode = bytecode[:hashIndex]
+	if bytecode == nmcBytecodeString {
+		util.DeleteProperty("MODE=ACTIVENI", "/home/setup.conf")
+		modeActive := fmt.Sprint("MODE=ACTIVE\n")
+		util.AppendStringToFile("/home/setup.conf", modeActive)
+		contAddAppend := fmt.Sprint("CONTRACT_ADD=", contractAdd, "\n")
+		util.AppendStringToFile("/home/setup.conf", contAddAppend)
+		util.DeleteProperty("CONTRACT_ADD=", "/home/setup.conf")
+		nsi.RegisterNodeDetails(url)
+	}
 }
 
 func (nsi *NodeServiceImpl) ContractList() []ContractTableRow {
@@ -1284,6 +1540,35 @@ func (nsi *NodeServiceImpl) updateContractDetails(contractAddress string, contra
 	contDescriptionMap[contractAddress] = description
 	successResponse.Status = "Successfully updated contract details"
 	return successResponse
+}
+
+func (nsi *NodeServiceImpl) returnCurrentInitializationState() SuccessResponseBool {
+	var successResponse SuccessResponseBool
+	state := currentState()
+	if state == "I" {
+		successResponse.Status = true
+	}
+	return successResponse
+}
+
+func currentMode() string {
+	var mode string
+	exists := util.PropertyExists("MODE", "/home/setup.conf")
+	if exists != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		mode = util.MustGetString("MODE", p)
+	}
+	return mode
+}
+
+func currentState() string {
+	var state string
+	exists := util.PropertyExists("STATE", "/home/setup.conf")
+	if exists != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		state = util.MustGetString("STATE", p)
+	}
+	return state
 }
 
 func (nsi *NodeServiceImpl) ABICrawler(url string) {
@@ -1466,9 +1751,16 @@ func (nsi *NodeServiceImpl) getNodeIPs(url string) []connectedIP {
 	var ipList []connectedIP
 	var connectedIPs = map[string]int{}
 	ethClient := client.EthClient{nodeUrl}
+	fromAddress := ethClient.Coinbase()
 	enode := ethClient.AdminNodeInfo().ID
-	nsi.InitInternalContract(url)
-	nodeList := nsi.Nms.GetNodeDetailsList()
+	var contractAdd string
+	exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
+	if exists != "" {
+		p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
+		contractAdd = util.MustGetString("CONTRACT_ADD", p)
+	}
+	nms := contractclient.NetworkMapContractClient{client.EthClient{url}, contracthandler.ContractParam{fromAddress, contractAdd, "", nil}}
+	nodeList := nms.GetNodeDetailsList()
 	for _, node := range nodeList {
 		if node.Enode != enode {
 			count := connectedIPs[node.IP]
@@ -1484,290 +1776,13 @@ func (nsi *NodeServiceImpl) getNodeIPs(url string) []connectedIP {
 	return ipList
 }
 
-func (nsi *NodeServiceImpl) InitInternalContract(url string) {
-
-	if nsi.Nms.Ic == nil {
-		var contractAdd string
-		exists := util.PropertyExists("CONTRACT_ADD", "/home/setup.conf")
-		if exists != "" {
-			p := properties.MustLoadFile("/home/setup.conf", properties.UTF8)
-			contractAdd = util.MustGetString("CONTRACT_ADD", p)
-		}
-
-		if len(contractAdd) < 1 {
-			log.Error("InitInternalContract empty contract address")
-			return
-		}
-
-		eth, err := ethclient.Dial(url)
-		if err != nil {
-			log.Error("InitInternalContract ", err)
-		}
-
-		powerchain, err := internalContract.NewScClient(common.HexToAddress(contractAdd), eth)
-		if err != nil {
-			log.Error("internalContract.NewPowerChain ", err)
-		}
-		log.Info("InitInternalContract address: ", contractAdd)
-
-		nsi.Nms.Ic = powerchain
+func (nsi *NodeServiceImpl) updateWhitelist(ipList []string) SuccessResponse {
+	var update SuccessResponse
+	util.DeleteFile("/root/powerchain-maker/contracts/.whiteList")
+	util.CreateFile("/root/powerchain-maker/contracts/.whiteList")
+	for _, ip := range ipList {
+		util.AppendStringToFile("/root/powerchain-maker/contracts/.whiteList", fmt.Sprint(ip, "\n"))
 	}
-}
-
-// This wrapper is used in event listener for automatic voting
-func (nsi *NodeServiceImpl) ProposeValidator(event *powerchainScClient.PowerChainScClientAccountMining) {
-	validatorAddress := event.Account.String()
-	voteFlag := event.Mining
-	log.Info("Aut. ProposeValidator function invoked. Validator: ", validatorAddress, ", vote flag: ", voteFlag)
-	nsi.ethProposeValidator(nsi.Url, validatorAddress, voteFlag)
-
-	if validatorAddress == nsi.NodeAccAddress && nsi.MiningRegistered == false {
-		close(nsi.MiningRegisteredChan)
-		nsi.MiningRegistered = true
-	}
-}
-
-func (nsi *NodeServiceImpl) UpdateLastMainnetNotary(event *powerchainScClient.PowerChainScClientNotary) {
-	log.Info("New Mainnet Notary. LastProccesedBlock: ", event.LastBlock.Uint64(), ", blocksProcessedCount: ", event.BlocksProcessed.Int64())
-	nsi.LastPowerChainScNotaryBlock = event.LastBlock.Int64()
-}
-
-func (nsi *NodeServiceImpl) UnvoteValidatorInternal(validatorAddress string) {
-	log.Info("UnvoteValidator(itself) function invoked. Validator: ", validatorAddress)
-	nsi.ethProposeValidator(nsi.Url, validatorAddress, false)
-}
-
-func byte32(s []byte) (a *[32]byte) {
-	if len(a) <= len(s) {
-		a = (*[len(a)]byte)(unsafe.Pointer(&s[0]))
-	}
-	return a
-}
-
-func printHex(b []byte) {
-	dst := make([]byte, hex.EncodedLen(len(b)))
-
-	hex.Encode(dst, b)
-	fmt.Printf("\"0x%s\",", dst)
-}
-
-func logDebugNotaryData(actBlock int64, startBlock int64, endBlock int64) {
-	log.Debug("Notary Debug: BC actBlock: ", actBlock, ", notaryStartBlock: ", startBlock, ", notaryEndBlock: ", endBlock)
-}
-
-func (nsi *NodeServiceImpl) Notary(privateKey *ecdsa.PrivateKey) {
-	ethClient := client.EthClient{nsi.Url}
-
-	iAmValidator := false
-	for _, bftValidator := range ethClient.GetValidators(ethClient.BlockNumber()) {
-		if nsi.NodeAccAddress == bftValidator.String() {
-			iAmValidator = true
-		}
-	}
-
-	actblockNumber := util.HexStringtoInt64(ethClient.BlockNumber())
-
-	if iAmValidator == false {
-		log.Warn("As of block: ", actblockNumber, " you are not registred as validator on geth level. Please control this by attaching to the rpc port of your node and call istanbul.GetValidators(). ",
-			"In case your node is running for mote than 10 minutes and you are not voted as validator, please call StartMining on PowerChain SicechainManger here: https://www.powerchain.nordicenergy.io/sidechainmanager/ ",
-			"and you will be automatically voted as validator by other nodes.")
-		return
-	}
-
-	// Check every 30 minutes if there is different last notary block based on GetChainDynamicDetails() getter
-	// vs nsi.LastPowerChainScNotaryBlock which is updated by listener, if it is different, listener probably stopped working
-	nsi.NotaryInvokedCounter++
-	if nsi.NotaryInvokedCounter%30 == 0 {
-		nsi.NotaryInvokedCounter = 0
-
-		chainDynamicDetails, err := nsi.PowerChainContractClient.GetChainDynamicDetails()
-		if err == nil {
-			if chainDynamicDetails.LastNotaryBlock.Int64() > nsi.LastPowerChainScNotaryBlock {
-
-				log.Warn("Last notary block based on GetChainDynamicDetails() getter is bigger than the one, which is updated by listener (listener propably stopped working")
-				nsi.LastPowerChainScNotaryBlock = chainDynamicDetails.LastNotaryBlock.Int64()
-			}
-		} else {
-			log.Error("Unable to check LastMainnetNotaryBlock based on GetChainDynamicDetails(). Err: ", err)
-		}
-	}
-
-	if nsi.LastInternalNotary < nsi.LastPowerChainScNotaryBlock {
-		nsi.LastInternalNotary = nsi.LastPowerChainScNotaryBlock
-	}
-
-	multiplier := (actblockNumber - nsi.LastPowerChainScNotaryBlock) / nsi.NotaryPeriod
-
-	notaryEndBlock := nsi.LastPowerChainScNotaryBlock + nsi.NotaryPeriod*multiplier
-	notaryEndBlockHex := fmt.Sprint("0x", strconv.FormatInt(notaryEndBlock, 16))
-
-	// Do not process notary if there is not enough blocks since the last processed notary
-	if nsi.LastProcessedNotaryBlock >= notaryEndBlock {
-		return
-	}
-
-	if actblockNumber < notaryEndBlock {
-		return
-	}
-
-	//// Internal SC part ////
-	stats := ethClient.GetStatistics(fmt.Sprint("0x", strconv.FormatInt(nsi.LastPowerChainScNotaryBlock+1, 16)), notaryEndBlockHex)
-
-	// No transactions present, do no call notary
-	if len(stats.Users) == 0 {
-		// Show debug message only every 20 minutes
-		if nsi.NotaryInvokedCounter%20 == 0 {
-			log.Debug("Notary periodic check: Users consumptions from node statistics is empty")
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-		}
-		return
-	}
-
-	// No miners present, do no call notary
-	if len(stats.Validators) == 0 {
-		// Show debug message only every 20 minutes
-		if nsi.NotaryInvokedCounter%20 == 0 {
-			log.Debug("Notary periodic check: Miners from node statistics is empty")
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-		}
-		return
-	}
-
-	// Invalid max gas provided
-	if stats.MaxGas == 0 {
-		// Show debug message only every 20 minutes
-		if nsi.NotaryInvokedCounter%20 == 0 {
-			log.Debug("Notary periodic check: MaxGas from node statistics == 0")
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-		}
-		return
-	}
-
-	if nsi.LastInternalNotary < notaryEndBlock {
-		hashToSign, err := nsi.Nms.GetSignatureHashFromNotary(notaryEndBlock, stats.Validators, stats.BlocksMined, stats.Users, stats.GasConsumptions, stats.MaxGas)
-		if err != nil {
-			log.Error("Notary GetSignatureHashFromNotary err: ", err)
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-			return
-		}
-
-		signature, err := crypto.Sign(hashToSign[:], privateKey)
-		if err != nil {
-			log.Error("Notary crypto.Sign(hashToSign[:], privateKey) err: ", err)
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-			return
-		}
-
-		_, err = nsi.Nms.StoreSignature(notaryEndBlock, contractclient.Signature{uint8(int(signature[64])) + 27, *byte32(signature[:32]), *byte32(signature[32:64])})
-		if err != nil {
-			log.Error("Notary StoreSignature err: ", err)
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-			return
-		}
-
-		nsi.LastInternalNotary = notaryEndBlock
-	}
-
-	validators := ethClient.GetValidators(notaryEndBlockHex)
-	if len(validators) < 1 {
-		log.Error("Notary periodic check: there are no validators on node level")
-		logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-		return
-	}
-
-	//// External SC part ////
-	if validators[int(notaryEndBlock/nsi.NotaryPeriod)%len(validators)] == crypto.PubkeyToAddress(privateKey.PublicKey) {
-		nodeRequired := len(validators)
-		// if there is less or same number of nodes required by BFT (4), then you need all signatures
-		if nodeRequired > 4 {
-			nodeRequired = 2/3*nodeRequired + 1
-		}
-
-		sigCountBigInt, err := nsi.Nms.GetSignaturesCount(notaryEndBlock)
-		if err != nil {
-			log.Error("Notary GetSignaturesCount err: ", err)
-			logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-			return
-		}
-		sigCount := int(sigCountBigInt.Int64())
-
-		if (sigCount >= nodeRequired) && nsi.LastProcessedNotaryBlock != notaryEndBlock {
-			v := make([]uint8, 0, sigCount)
-			s := make([][32]byte, 0, sigCount)
-			r := make([][32]byte, 0, sigCount)
-			for i := 0; i < sigCount; i++ {
-				sig, err := nsi.Nms.GetSignatures(notaryEndBlock, i)
-				if err != nil {
-					log.Error("Notary GetSignaturesCount err: ", err)
-					logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-					continue
-				}
-
-				v = append(v, sig.V)
-				s = append(s, sig.S)
-				r = append(r, sig.R)
-			}
-
-			tx, err := nsi.PowerChainContractClient.Notary(bind.NewKeyedTransactor(privateKey), new(big.Int).SetInt64(nsi.LastPowerChainScNotaryBlock+1), new(big.Int).SetInt64(notaryEndBlock),
-				stats.Validators, stats.BlocksMined, stats.Users, stats.GasConsumptions, stats.MaxGas, v, r, s)
-			if err == nil {
-				log.Info("Notary successfully sent, tx Hash: ", tx.Hash().String())
-
-				nsi.LastProcessedNotaryBlock = notaryEndBlock
-			} else {
-				//reset notary in case of error (maybe not enough staking)
-				nsi.LastProcessedNotaryBlock = nsi.LastPowerChainScNotaryBlock
-
-				log.Error("Notary failed: ", err)
-				logDebugNotaryData(actblockNumber, nsi.LastPowerChainScNotaryBlock+1, notaryEndBlock)
-
-				// Prints notary data
-				log.Info("Sent Data: ")
-
-				var minersData string = "["
-				var blocksData string = "["
-				for index, statsMiner := range stats.Validators {
-					minersData += "\"" + statsMiner.String() + "\","
-					blocksData += strconv.FormatInt(int64(stats.BlocksMined[index]), 10) + ","
-				}
-				minersData += "]"
-				blocksData += "]"
-
-				var usersData string = "["
-				var gasData string = "["
-				for index, statsUser := range stats.Users {
-					usersData += "\"" + statsUser.String() + "\","
-					gasData += strconv.FormatInt(int64(stats.GasConsumptions[index]), 10) + ","
-				}
-				usersData += "]"
-				gasData += "]"
-
-				sentData := "StartBlock:\n" + strconv.FormatInt(nsi.LastPowerChainScNotaryBlock+1, 10) + "\n" +
-					"EndBlock:\n" + strconv.FormatInt(notaryEndBlock, 10) + "\n" +
-					"Miners:\n" + minersData + "\n" +
-					"BlocksMined:\n" + blocksData + "\n" +
-					"Users:\n" + usersData + "\n" +
-					"GasCOnsumptions:\n" + gasData + "\n" +
-					"LargestTx:\n" + strconv.FormatInt(int64(stats.MaxGas), 10) + "\n"
-				fmt.Printf(sentData)
-
-				fmt.Printf("v\n")
-				for _, vGet := range v {
-					fmt.Printf(strconv.Itoa(int(vGet)))
-					fmt.Printf(", ")
-				}
-
-				fmt.Printf("r\n")
-				for _, rGet := range r {
-					printHex(rGet[:])
-				}
-
-				fmt.Printf("\ns\n")
-				for _, sGet := range s {
-					printHex(sGet[:])
-				}
-				fmt.Printf("\n\n")
-			}
-		}
-	}
+	update.Status = "IP Whitelist has been updated successfully"
+	return update
 }

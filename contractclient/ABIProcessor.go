@@ -3,8 +3,8 @@ package contractclient
 import (
 	"encoding/hex"
 	"fmt"
-	"github.com/nordicenergy/powerchain/accounts/abi"
-	"github.com/nordicenergy/powerchain/crypto"
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/nordicenergy/powerchain-maker-nodemanager/contracthandler"
 	"strings"
 )

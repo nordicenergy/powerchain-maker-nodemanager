@@ -2,11 +2,10 @@ package client
 
 import (
 	"fmt"
-	"time"
-
-	"github.com/ybbus/jsonrpc"
 	"github.com/nordicenergy/powerchain-maker-nodemanager/contracthandler"
-	"github.com/nordicenergy/powerchain/common"
+	"github.com/ybbus/jsonrpc"
+	"log"
+	"time"
 )
 
 type AdminInfo struct {
@@ -130,24 +129,6 @@ type EthClient struct {
 	Url string
 }
 
-// AccountStats
-// in case it refers to validators, value means number of mined blocks
-// in case it refers to users, value means tootal users's gas consumption
-type AccountStats struct {
-	Account common.Address
-	Value   uint64
-}
-
-type IstanbulStats struct {
-	Validators  []common.Address `json:"validators"`
-	BlocksMined []uint32         `json:"blocks_mined"`
-
-	Users           []common.Address `json:"users"`
-	GasConsumptions []uint64         `json:"gas_consumptions"`
-
-	MaxGas uint64 `json:"max_gas_used"`
-}
-
 func (ec *EthClient) GetTransactionByHash(txNo string) TransactionDetailsResponse {
 	rpcClient := jsonrpc.NewClient(ec.Url)
 	response, err := rpcClient.Call("eth_getTransactionByHash", txNo)
@@ -156,56 +137,6 @@ func (ec *EthClient) GetTransactionByHash(txNo string) TransactionDetailsRespons
 		fmt.Println(err)
 	}
 	txResponse := TransactionDetailsResponse{}
-	err = response.GetObject(&txResponse)
-	if err != nil {
-		fmt.Println(err)
-	}
-	return txResponse
-}
-
-func (ec *EthClient) ProposeValidator(address string, vote bool) error {
-	rpcClient := jsonrpc.NewClient(ec.Url)
-	_, err := rpcClient.Call("istanbul_propose", address, vote)
-
-	if err != nil {
-		fmt.Println(err)
-		return err
-	}
-
-	return nil
-}
-
-func (ec *EthClient) GetValidators(blockNumber string) []common.Address {
-	rpcClient := jsonrpc.NewClient(ec.Url)
-
-	txResponse := []common.Address{}
-	response, err := rpcClient.Call("istanbul_getValidators", blockNumber)
-
-	if err != nil {
-		fmt.Println(err)
-		return txResponse
-	}
-
-	err = response.GetObject(&txResponse)
-
-	if err != nil {
-		fmt.Println(err)
-		return txResponse
-	}
-
-	return txResponse
-}
-
-func (ec *EthClient) GetStatistics(start string, end string) IstanbulStats {
-	rpcClient := jsonrpc.NewClient(ec.Url)
-	response, err := rpcClient.Call("istanbul_getStatistics", start, end)
-
-	if err != nil {
-		fmt.Println(err)
-		return IstanbulStats{}
-	}
-
-	txResponse := IstanbulStats{}
 	err = response.GetObject(&txResponse)
 	if err != nil {
 		fmt.Println(err)
@@ -298,6 +229,31 @@ func (ec *EthClient) Coinbase() string {
 	return coinbase
 }
 
+func (ec *EthClient) RaftRole() string {
+	rpcClient := jsonrpc.NewClient(ec.Url)
+	response, err := rpcClient.Call("raft_role")
+	if err != nil {
+		fmt.Println(err)
+	}
+	var raftRole string
+	err = response.GetObject(&raftRole)
+	if err != nil {
+		fmt.Println(err)
+	}
+	return raftRole
+}
+
+func (ec *EthClient) RaftAddPeer(request string) int {
+	rpcClient := jsonrpc.NewClient(ec.Url)
+	response, err := rpcClient.Call("raft_addPeer", request)
+	var raftId int
+	err = response.GetObject(&raftId)
+	if err != nil {
+		log.Println(err)
+	}
+	return raftId
+}
+
 func (ec *EthClient) GetTransactionReceipt(txNo string) TransactionReceiptResponse {
 	rpcClient := jsonrpc.NewClient(ec.Url)
 	response, err := rpcClient.Call("eth_getTransactionReceipt", txNo)
@@ -331,11 +287,8 @@ func (ec *EthClient) SendTransaction(param contracthandler.ContractParam, rh con
 	response, err = rpcClient.Call("eth_sendTransaction", []interface{}{p})
 
 	if err != nil || response.Error != nil {
-		if err != nil {
-			fmt.Println(err)
-		} else {
-			fmt.Println(response.Error)
-		}
+
+		fmt.Println(err)
 	}
 
 	//fmt.Printf("%s", response.Result)
@@ -394,9 +347,9 @@ func (ec *EthClient) NetListening() bool {
 	return listening
 }
 
-func (ec *EthClient) GetQuorumPayload(input string) string {
+func (ec *EthClient) GetPowerChainPayload(input string) string {
 	rpcClient := jsonrpc.NewClient(ec.Url)
-	response, err := rpcClient.Call("eth_getQuorumPayload", input)
+	response, err := rpcClient.Call("eth_getPowerChainPayload", input)
 	if err != nil {
 		fmt.Println(err)
 	}

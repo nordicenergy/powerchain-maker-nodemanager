@@ -1,28 +1,21 @@
 package main
 
 import (
-	"context"
-	"crypto/ecdsa"
-	"errors"
-	"flag"
 	"fmt"
-	"math/big"
-	"net/http"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"time"
-
+	"context"
 	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 	"github.com/nordicenergy/powerchain-maker-nodemanager/client"
 	"github.com/nordicenergy/powerchain-maker-nodemanager/contractclient"
 	"github.com/nordicenergy/powerchain-maker-nodemanager/service"
-	"github.com/nordicenergy/powerchain/accounts/abi/bind"
-	"github.com/nordicenergy/powerchain/crypto"
-	powerchainScClient "github.com/nordicenergy/powerchain/contracts/client"
+	"net/http"
+	"os"
+	"os/signal"
+	"time"
 )
+
+var nodeUrl = "http://localhost:22000"
+var listenPort = ":8000"
 
 func init() {
 	log.SetFormatter(&log.JSONFormatter{})
@@ -31,27 +24,17 @@ func init() {
 }
 
 func main() {
-	nodeUrl := flag.String("nodeUrl", "http://localhost:22000", "Node url")
-	listenPort := flag.Int("listenPort", 8000, "Listening Port")
-	infuraURL := flag.String("infuraURL", "", "Infura URL, which connects to the ethereum network (e.g. wss://ropsten.infura.io/ws)")
-	contractAddress := flag.String("contractAddress", "", "PowerChain contract address")
-	privateKeyStr := flag.String("privateKey", "", "Private Key for mining (Must be valid ethereum key)")
-	chainID := flag.Int("chainID", 0, "Chain ID of the sidechain registered in PowerChain contract to connect to")
-	miningFlag := flag.Bool("miningFlag", false, "Flag if nodemanager is running on top of geth, which is also mining")
-	flag.Parse()
 
-	listenPortStr := ":" + strconv.Itoa(*listenPort)
-	// Init PowerChain contract client
-	contractClient, auth, pubKey, err := InitPowerChainContractClient(*infuraURL, *contractAddress, *chainID, *privateKeyStr, *miningFlag)
-	if err != nil {
-		log.Fatal("PowerChain contract client initialization failed. Err: ", err)
+	if len(os.Args) > 1 {
+		nodeUrl = os.Args[1]
+	}
+
+	if len(os.Args) > 2 {
+		listenPort = ":" + os.Args[2]
 	}
 
 	router := mux.NewRouter()
-	nodeService, err := service.NewNodeServiceImpl(*nodeUrl, contractClient, pubKey, &contractclient.NetworkMapContractClient{client.EthClient{*nodeUrl}, auth, nil})
-	if err != nil {
-		log.Fatal("NewNodeServiceImpl init failed. Error: ", err)
-	}
+	nodeService := service.NodeServiceImpl{nodeUrl}
 
 	ticker := time.NewTicker(86400 * time.Second)
 	go func() {
@@ -63,115 +46,70 @@ func main() {
 	}()
 
 	go func() {
-		nodeService.CheckGethStatus(*nodeUrl)
-		log.Info("Geth is running")
-
-		if *miningFlag == true {
-			// Start standalone event listeners
-			go contractClient.Start_accMiningEventListener(nodeService.ProposeValidator)
-			go contractClient.Start_notaryEventListener(nodeService.UpdateLastMainnetNotary)
-
-			userDetails, err := contractClient.GetUserDetails(pubKey)
-			if err != nil {
-				log.Fatal("Unable to call GetUserDetails on SC. Err: ", err)
-			}
-
-			if userDetails.Mining == false {
-				// Let powerchain SC know that this node wants to start mining
-				tx, err := contractClient.StartMining(auth)
-				if err != nil {
-					log.Fatal("Unable to start mining. Err: ", err)
-				}
-				log.Info("StartMining tx sent")
-
-				ethScanURL := ""
-				if strings.Contains(*infuraURL, "ropsten") == true {
-					ethScanURL = "https://ropsten.etherscan.io/tx/" + tx.Hash().String()
-				} else {
-					ethScanURL = "https://etherscan.io/tx/" + tx.Hash().String()
-				}
-
-				nodeService.MiningRegistered = false
-				nodeService.MiningRegisteredChan = make(chan struct{})
-
-				terminalMsg :=
-					"\n*****************************************************************************\n" +
-						"**** Waiting for StartMinig to be registered in PowerChain Smart Contract... ****\n" +
-						"*****************************************************************************\n\n" +
-
-						"It might take from few seconds to few hours(edge case when ethereum network is halted). " +
-						"You can check status of the StartMining transaction here:\n" + ethScanURL + "\n\n" +
-						"In case it takes too long and you need to speed up things, you can manually call StartMining method with " +
-						"higher gas price through our SideChain Manager here:\https://sidechain.nordicenergy.io/\n\n" +
-						"Do not shut down this process in the meantime.\n\n" +
-						"*****************************************************************************\n\n"
-				fmt.Printf(terminalMsg)
-
-				// Wait for StartMining to be processed so user can register his node without being rejected by nodes
-				// Validators can send free tx only once per 5 seconds and they must be registered in SC as active validators
-				<-nodeService.MiningRegisteredChan
-
-				// Wait a few seconds so nodes register this account as active validator and do not reject it's internal SC transactions
-				time.Sleep(5 * time.Second)
-				log.Info("StartMining successfully registered")
-			}
-		}
-
-		nodeService.NetworkManagerContractDeployer(*nodeUrl)
-		nodeService.RegisterNodeDetails(*nodeUrl)
-		nodeService.ContractCrawler(*nodeUrl)
-		nodeService.ABICrawler(*nodeUrl)
-
-		if *miningFlag == true {
-			notaryTicker := time.NewTicker(60 * time.Second)
-			go func() {
-				privateKey, err := crypto.HexToECDSA(*privateKeyStr)
-				if err != nil {
-					log.Fatal("Unable to process provided private key")
-				}
-				for range notaryTicker.C {
-					nodeService.Notary(privateKey)
-				}
-			}()
-		}
-
-		log.Info("Node is running")
+		nodeService.CheckGethStatus(nodeUrl)
+		//log.Info("Deploying Network Manager Contract")
+		nodeService.NetworkManagerContractDeployer(nodeUrl)
+		nodeService.RegisterNodeDetails(nodeUrl)
+		nodeService.ContractCrawler(nodeUrl)
+		nodeService.ABICrawler(nodeUrl)
+		nodeService.IPWhitelister()
 	}()
 
+	networkMapService := contractclient.NetworkMapContractClient{EthClient: client.EthClient{nodeUrl}}
 	router.HandleFunc("/txn/{txn_hash}", nodeService.GetTransactionInfoHandler).Methods("GET")
 	router.HandleFunc("/txn", nodeService.GetLatestTransactionInfoHandler).Methods("GET")
 	router.HandleFunc("/block/{block_no}", nodeService.GetBlockInfoHandler).Methods("GET")
 	router.HandleFunc("/block", nodeService.GetLatestBlockInfoHandler).Methods("GET")
 	router.HandleFunc("/genesis", nodeService.GetGenesisHandler).Methods("POST", "OPTIONS")
 	router.HandleFunc("/peer/{peer_id}", nodeService.GetOtherPeerHandler).Methods("GET")
+	router.HandleFunc("/peer", nodeService.JoinNetworkHandler).Methods("POST", "OPTIONS")
 	router.HandleFunc("/peer", nodeService.GetCurrentNodeHandler).Methods("GET")
-	router.HandleFunc("/nmcAddress", nodeService.GetNmcAddress).Methods("POST")
 	router.HandleFunc("/txnrcpt/{txn_hash}", nodeService.GetTransactionReceiptHandler).Methods("GET")
+	router.HandleFunc("/pendingJoinRequests", nodeService.PendingJoinRequestsHandler).Methods("GET")
+	router.HandleFunc("/joinRequestResponse", nodeService.JoinRequestResponseHandler).Methods("POST")
+	router.HandleFunc("/joinRequestResponse", nodeService.OptionsHandler).Methods("OPTIONS")
+	router.HandleFunc("/createNetwork", nodeService.CreateNetworkScriptCallHandler).Methods("POST")
+	router.HandleFunc("/createNetwork", nodeService.OptionsHandler).Methods("OPTIONS")
+	router.HandleFunc("/joinNetwork", nodeService.JoinNetworkScriptCallHandler).Methods("POST")
+	router.HandleFunc("/joinNetwork", nodeService.OptionsHandler).Methods("OPTIONS")
 	router.HandleFunc("/deployContract", nodeService.DeployContractHandler).Methods("POST")
+	router.HandleFunc("/reset", nodeService.ResetHandler).Methods("GET")
+	router.HandleFunc("/restart", nodeService.RestartHandler).Methods("GET")
 	router.HandleFunc("/latestBlock", nodeService.LatestBlockHandler).Methods("GET")
 	router.HandleFunc("/latency", nodeService.LatencyHandler).Methods("GET")
+	//router.HandleFunc("/logs", nodeService.LogsHandler).Methods("GET")
 	router.HandleFunc("/txnsearch/{txn_hash}", nodeService.TransactionSearchHandler).Methods("GET")
-	router.HandleFunc("/getNodeDetails/{index}", nodeService.Nms.GetNodeDetailsResponseHandler).Methods("GET")
-	router.HandleFunc("/getNodeList", nodeService.Nms.GetNodeListSelfResponseHandler).Methods("GET")
-	router.HandleFunc("/activeNodes", nodeService.Nms.ActiveNodesHandler).Methods("GET")
+	router.HandleFunc("/mailserver", nodeService.MailServerConfigHandler).Methods("POST")
+	router.HandleFunc("/mailserver", nodeService.OptionsHandler).Methods("OPTIONS")
+	router.HandleFunc("/registerNode", networkMapService.RegisterNodeRequestHandler).Methods("POST")
+	router.HandleFunc("/updateNode", networkMapService.UpdateNodeHandler).Methods("POST")
+	router.HandleFunc("/updateNode", networkMapService.OptionsHandler).Methods("OPTIONS")
+	router.HandleFunc("/getNodeDetails/{index}", networkMapService.GetNodeDetailsResponseHandler).Methods("GET")
+	router.HandleFunc("/getNodeList", networkMapService.GetNodeListSelfResponseHandler).Methods("GET")
+	router.HandleFunc("/activeNodes", networkMapService.ActiveNodesHandler).Methods("GET")
 	router.HandleFunc("/chartData", nodeService.GetChartDataHandler).Methods("GET")
 	router.HandleFunc("/contractList", nodeService.GetContractListHandler).Methods("GET")
 	router.HandleFunc("/contractCount", nodeService.GetContractCountHandler).Methods("GET")
 	router.HandleFunc("/updateContractDetails", nodeService.ContractDetailsUpdateHandler).Methods("POST")
+	router.HandleFunc("/attachedNodeDetails", nodeService.AttachedNodeDetailsHandler).Methods("POST")
+	router.HandleFunc("/initialized", nodeService.InitializationHandler).Methods("GET")
 	router.HandleFunc("/createAccount", nodeService.CreateAccountHandler).Methods("POST")
 	router.HandleFunc("/createAccount", nodeService.OptionsHandler).Methods("OPTIONS")
 	router.HandleFunc("/getAccounts", nodeService.GetAccountsHandler).Methods("GET")
+	router.HandleFunc("/getWhitelist", nodeService.GetWhitelistedIPsHandler).Methods("GET")
+	router.HandleFunc("/updateWhitelist", nodeService.UpdateWhitelistHandler).Methods("POST")
+	router.HandleFunc("/updateWhitelist", nodeService.OptionsHandler).Methods("OPTIONS")
 
 	router.PathPrefix("/contracts").Handler(http.StripPrefix("/contracts", http.FileServer(http.Dir("/root/powerchain-maker/contracts"))))
 	router.PathPrefix("/geth").Handler(http.StripPrefix("/geth", http.FileServer(http.Dir("/home/node/qdata/gethLogs"))))
 	router.PathPrefix("/constellation").Handler(http.StripPrefix("/constellation", http.FileServer(http.Dir("/home/node/qdata/constellationLogs"))))
 	router.PathPrefix("/").Handler(http.StripPrefix("/", NewFileServer("NodeManagerUI")))
 
-	log.Info(fmt.Sprintf("Node Manager listening on %s...", listenPortStr))
+	log.Info(fmt.Sprintf("Node Manager listening on %s...", listenPort))
 
 	srv := &http.Server{
 		Handler: router,
-		Addr:    "0.0.0.0" + listenPortStr,
+		Addr:    "0.0.0.0" + listenPort,
 
 		//WriteTimeout: 15 * time.Second,
 		//ReadTimeout:  15 * time.Second,
@@ -191,32 +129,6 @@ func main() {
 
 	// Block until we receive our signal.
 	<-c
-
-	if *miningFlag == true {
-		isActiveValidator := true
-
-		userDetails, err := contractClient.GetUserDetails(pubKey)
-		if err == nil {
-			isActiveValidator = userDetails.Mining
-		} else {
-			log.Error("Unable to call IsActiveValidator on SC during shutdown. Unvote validator as he was active. Err: ", err)
-		}
-
-		if isActiveValidator == true {
-			// Unvote itself
-			nodeService.UnvoteValidatorInternal(pubKey)
-
-			// Stop mining
-			tx, err := contractClient.StopMining(auth)
-			if err != nil {
-				log.Fatal("Unable to stop mining. Err: ", err)
-			}
-			log.Info("StoptMining tx sent. Hash: ", tx.Hash().String())
-		}
-	}
-
-	// Deinit powerchain smart contract cliet
-	contractClient.DeInit()
 
 	// Create a deadline to wait for.
 	ctx, cancel := context.WithTimeout(context.Background(), 15)
@@ -249,52 +161,4 @@ func (mf *MyFileServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mf.handler.ServeHTTP(w, r)
-}
-
-func InitPowerChainContractClient(
-	infuraURL string,
-	contractAddress string,
-	chainID int,
-	privateKeyStr string,
-	miningFlag bool) (client *powerchainScClient.ContractClient, auth *bind.TransactOpts, pubKey string, err error) {
-
-	log.Info("Initialize PowerChain Contract Client")
-	err = nil
-
-	if privateKeyStr == "" {
-		err = errors.New("NodeManager misconfiguration. Private key must be provided")
-		return
-	}
-
-	// Init PowerChain Smartcontract client
-	client, err = powerchainScClient.NewClient(infuraURL, contractAddress, big.NewInt(int64(chainID)))
-	if err != nil {
-		return
-	}
-
-	// Init PowerChain Smartcontract event listeners and auth
-	if miningFlag == true {
-		err = client.InitAccMiningEventListener()
-		if err != nil {
-			log.Error("Unable to init 'StartMining' event listeners")
-			return
-		}
-
-		err = client.InitNotaryEventListener()
-		if err != nil {
-			log.Error("Unable to init 'Notary' event listeners")
-			return
-		}
-	}
-
-	var privateKey *ecdsa.PrivateKey
-	privateKey, err = crypto.HexToECDSA(privateKeyStr)
-	if err != nil {
-		log.Error("Unable to process provided private key")
-		return
-	}
-	pubKey = crypto.PubkeyToAddress(privateKey.PublicKey).String()
-	auth = bind.NewKeyedTransactor(privateKey)
-
-	return
 }

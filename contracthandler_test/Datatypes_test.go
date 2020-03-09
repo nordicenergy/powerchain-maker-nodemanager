@@ -2,7 +2,6 @@ package contracthandler_test
 
 import (
 	"testing"
-
 	"github.com/nordicenergy/powerchain-maker-nodemanager/contracthandler"
 )
 
@@ -17,9 +16,10 @@ func TestIsSuported(t *testing.T) {
 
 }
 
+
 func getDatatypesTestData() []string {
 
-	data := []string{
+	data := []string {
 		"Func(uint256)",
 		"uint256",
 		"uint256,address",

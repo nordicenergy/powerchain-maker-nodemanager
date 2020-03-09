@@ -54,8 +54,8 @@ func TestRegisterNode(t *testing.T) {
 	txRec := nmc.RegisterNode(
 		"RBC1",
 		"Bank",
-		"0x4308aa060c5e193191ea96650a3c7b44ef1e9090",
-		"0x4308aa060c5e193191ea96650a3c7b44ef1e9091",
+		"0xe47D32583f62AD6938d9f3C80aa5A5050b4cB4DE",
+		"0x66586d8a9F1dd68D254a3E5c0222c25931EeBAe9",
 		"10.0.2.15",
 		"1",
 	)
@@ -76,8 +76,8 @@ func TestUpdateNode(t *testing.T) {
 	txRec := nmc.UpdateNode(
 		"RBC1",
 		"Custodian",
-		"0x4308aa060c5e193191ea96650a3c7b44ef1e9090",
-		"0x4308aa060c5e193191ea96650a3c7b44ef1e9091",
+		"0xe47D32583f62AD6938d9f3C80aa5A5050b4cB4DE",
+		"0x66586d8a9F1dd68D254a3E5c0222c25931EeBAe9",
 		"10.0.2.15",
 		"1",
 	)
@@ -118,7 +118,7 @@ func TestGetNodeDetailsList(t *testing.T) {
 
 func getContractParam() contracthandler.ContractParam {
 	return contracthandler.ContractParam{
-		"0x4d0a4c762bd7f742096daaf5911dcf9c94b9ea95",
+		"0xfaf947731d6256b9f1da3e3bede1750881e21092",
 		"0x56776f1d261e75253f110ac9091367956bce2f32",
 		"",
 		nil,
